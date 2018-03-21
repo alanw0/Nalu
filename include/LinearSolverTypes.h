@@ -69,6 +69,34 @@ class Preconditioner;
 namespace sierra{
 namespace nalu{
 
+template<typename LocalOrdinal, typename GlobalOrdinal, typename Node>
+class NaluCrsGraph : public Tpetra::CrsGraph<LocalOrdinal, GlobalOrdinal, Node>
+{
+public:
+    NaluCrsGraph(Teuchos::RCP<Tpetra::Map<LocalOrdinal,GlobalOrdinal,Node> > rowMap,
+                 Teuchos::RCP<Tpetra::Map<LocalOrdinal,GlobalOrdinal,Node> > colMap,
+                 Kokkos::DualView<size_t*, DeviceSpace> rowLengths,
+                 Tpetra::ProfileType profileType)
+    : Tpetra::CrsGraph<LocalOrdinal,GlobalOrdinal,Node>(rowMap, colMap, rowLengths, profileType)
+    {
+    }
+
+    NaluCrsGraph(Teuchos::RCP<Tpetra::Map<LocalOrdinal,GlobalOrdinal,Node> > rowMap,
+                 size_t nonzerosPerRow)
+    : Tpetra::CrsGraph<LocalOrdinal,GlobalOrdinal,Node>(rowMap, nonzerosPerRow)
+    {
+    }
+
+    void allocateColIndices()
+    {
+        this->allocateIndices(Tpetra::GlobalIndices);
+    }
+    void insertGlobalIndicesIntoLocalRow(LocalOrdinal localRow, size_t numColIndices, const GlobalOrdinal* colIndices)
+    {
+        this->insertGlobalIndicesImpl(localRow, colIndices, numColIndices);
+    }
+};
+
 class TpetraLinearSolver;
 
 struct LinSys {
@@ -83,7 +111,7 @@ typedef Tpetra::Map<LocalOrdinal, GlobalOrdinal>::node_type                Node;
 typedef Teuchos::MpiComm<int>                                              Comm;
 typedef Tpetra::Export< LocalOrdinal, GlobalOrdinal, Node >                Export;
 typedef Tpetra::Import< LocalOrdinal, GlobalOrdinal, Node >                Import;
-typedef Tpetra::CrsGraph< LocalOrdinal, GlobalOrdinal, Node>               Graph;
+typedef NaluCrsGraph< LocalOrdinal, GlobalOrdinal, Node>               Graph;
 typedef Tpetra::Map<LocalOrdinal,GlobalOrdinal,Node>                       Map;
 typedef Tpetra::MultiVector<Scalar,LocalOrdinal,GlobalOrdinal,Node>        MultiVector;
 typedef Teuchos::ArrayRCP<Scalar >                                         OneDVector;
