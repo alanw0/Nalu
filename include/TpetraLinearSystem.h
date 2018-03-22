@@ -195,9 +195,6 @@ private:
   // Map of rows my proc owns (locally owned)
   Teuchos::RCP<LinSys::Map>    ownedRowsMap_;
 
-  // Map of all rows my proc references
-  Teuchos::RCP<LinSys::Map>    ownedPlusGloballyOwnedRowsMap_;
-
   // Only nodes that share with other procs that I don't own = Global = !locally owned
   Teuchos::RCP<LinSys::Map>    globallyOwnedRowsMap_;
 
@@ -217,10 +214,8 @@ private:
   Teuchos::RCP<LinSys::Vector> sln_;
   Teuchos::RCP<LinSys::Vector> globalSln_;
   Teuchos::RCP<LinSys::Export> exporter_;
-  Teuchos::RCP<LinSys::Import> importer_;
 
   MyLIDMapType myLIDs_;
-  std::vector<LocalOrdinal> entityToRowLID_;
   std::vector<LocalOrdinal> entityToColLID_;
   std::vector<LocalOrdinal> entityToLID_;
   LocalOrdinal maxOwnedRowId_; // = num_owned_nodes * numDof_

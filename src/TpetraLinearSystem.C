@@ -78,8 +78,6 @@ namespace nalu{
 ///======== T P E T R A ===============================================================================================================
 ///====================================================================================================================================
 
-static int counter_ = 0;
-
 //==========================================================================
 // Class Definition
 //==========================================================================
@@ -149,8 +147,6 @@ TpetraLinearSystem::beginLinearSystemConstruction()
   ThrowRequire(ownedGraph_.is_null());
   stk::mesh::BulkData & bulkData = realm_.bulk_data();
   stk::mesh::MetaData & metaData = realm_.meta_data();
-  const unsigned p_rank = bulkData.parallel_rank();
-  (void)p_rank;
 
   // create a localID for all active nodes in the mesh...
   const stk::mesh::Selector s_universal = metaData.universal_part()
@@ -202,8 +198,8 @@ TpetraLinearSystem::beginLinearSystemConstruction()
   maxGloballyOwnedRowId_ = numNodes * numDof_;
 
   // Next, grab all the global ids, owned first, then globallyOwned.
-  totalGids_.clear();
-  totalGids_.reserve(numNodes * numDof_);
+  //totalGids_.clear();
+  //totalGids_.reserve(numNodes * numDof_);
 
   // Also, we'll build up our own local id map. Note: first we number
   // the owned nodes then we number the globallyOwned nodes.
@@ -211,7 +207,12 @@ TpetraLinearSystem::beginLinearSystemConstruction()
 
   // make separate arrays that hold the owned and globallyOwned gids
   std::vector<stk::mesh::Entity> owned_nodes, globally_owned_nodes;
+  owned_nodes.reserve(numOwnedNodes);
+  globally_owned_nodes.reserve(numGloballyOwnedNotLocallyOwned);
+
   std::vector<GlobalOrdinal> ownedGids, globallyOwnedGids;
+  ownedGids.reserve(maxOwnedRowId_);
+  globallyOwnedGids.reserve(numGloballyOwnedNotLocallyOwned*numDof_);
 
   // owned first:
   for(const stk::mesh::Bucket* bptr : buckets) {
@@ -233,12 +234,9 @@ TpetraLinearSystem::beginLinearSystemConstruction()
     MyLIDMapType::iterator found = myLIDs_.find(entityId);
     if (found == myLIDs_.end()) {
       myLIDs_[entityId] = numDof_*localId++;
-//if (entity.local_offset()==2 || entity.local_offset()==10101){
-//std::cerr<<"offset="<<entity.local_offset()<<", owned id="<<entityId<<", stk-id="<<bulkData.identifier(entity)<<", lid="<<myLIDs_[entityId]<<std::endl;
-//}
       for(unsigned idof=0; idof < numDof_; ++ idof) {
         const GlobalOrdinal gid = GID_(entityId, numDof_, idof);
-        totalGids_.push_back(gid);
+        //totalGids_.push_back(gid);
         ownedGids.push_back(gid);
       }
     }
@@ -262,20 +260,14 @@ TpetraLinearSystem::beginLinearSystemConstruction()
     MyLIDMapType::iterator found = myLIDs_.find(naluId);
     if (found == myLIDs_.end()) {
       myLIDs_[naluId] = numDof_*localId++;
-//if (entity.local_offset()==2 || entity.local_offset()==10101){
-//std::cerr<<"offset="<<entity.local_offset()<<", shared id="<<naluId<<", stk-id="<<bulkData.identifier(entity)<<", lid="<<myLIDs_[naluId]<<std::endl;
-//}
       for(unsigned idof=0; idof < numDof_; ++ idof) {
         const GlobalOrdinal gid = GID_(naluId, numDof_, idof);
-        totalGids_.push_back(gid);
+        //totalGids_.push_back(gid);
         globallyOwnedGids.push_back(gid);
       }
     }
   }
   
-  const int numOwnedRows = numOwnedNodes * numDof_;
-  (void)numOwnedRows;
-
   std::sort(ownedGids.begin(), ownedGids.end());
   std::sort(globallyOwnedGids.begin(), globallyOwnedGids.end());
 
@@ -284,25 +276,19 @@ TpetraLinearSystem::beginLinearSystemConstruction()
   globallyOwnedRowsMap_ = Teuchos::rcp(new LinSys::Map(Teuchos::OrdinalTraits<Tpetra::global_size_t>::invalid(), globallyOwnedGids, 1, tpetraComm, node_));
 
   exporter_ = Teuchos::rcp(new LinSys::Export(globallyOwnedRowsMap_, ownedRowsMap_));
-  importer_ = Teuchos::rcp(new LinSys::Import(ownedRowsMap_, globallyOwnedRowsMap_));
 
-  ownedPlusGloballyOwnedRowsMap_ = Teuchos::rcp(new LinSys::Map(Teuchos::OrdinalTraits<Tpetra::global_size_t>::invalid(), totalGids_, 1, tpetraComm, node_));
-
-  // Now, we're ready to have Algs call the build*Graph() methods and build up the connection list (row,col).
   size_t numGraphEntriesGuess = 15*numOwnedNodes;
   if (eqSys_->num_graph_entries_ > 0) {
     numGraphEntriesGuess = 1.1*eqSys_->num_graph_entries_;
   }
 
   connectionSetKK_ = ConnectionSetKK(numGraphEntriesGuess);
+  // Now, we're ready to have Algs call the build*Graph() methods and build up the connection list (row,col).
 }
 
 int TpetraLinearSystem::addConnections(const stk::mesh::Entity* entities, const size_t& num_entities)
 {
   int fail_count = 0;
-  stk::mesh::BulkData & bulkData = realm_.bulk_data();
-  const unsigned p_rank = bulkData.parallel_rank();
-  (void)p_rank;
 
   for(size_t a=0; a < num_entities; ++a) {
     const stk::mesh::Entity entity_a = entities[a];
@@ -762,35 +748,30 @@ void add_to_length(ViewType& v_owned, ViewType& v_shared, unsigned numDof,
 
 void add_lengths_to_comm(const stk::mesh::BulkData& bulk,
                          nalu_stk::CommNeighbors& commNeighbors,
-                         stk::mesh::Entity entity_a,
+                         int entity_a_owner,
                          stk::mesh::EntityId entityId_a,
-                         unsigned numDof_,
+                         unsigned numDof,
                          unsigned numColEntities,
                          const stk::mesh::EntityId* colEntityIds,
                          const int* colOwners)
 {   
-    int owner = bulk.parallel_owner_rank(entity_a);
+    int owner = entity_a_owner;
     nalu_stk::CommBufferV& sbuf = commNeighbors.send_buffer(owner);
-    unsigned numColDofs = numDof_*numColEntities; 
-    GlobalOrdinal gid0 = GID_(entityId_a, numDof_ , 0);
+    GlobalOrdinal gid0 = GID_(entityId_a, numDof , 0);
     
-    for(unsigned d=0; d<numDof_; ++d) {
-        sbuf.pack(gid0++);
-        sbuf.pack(numColDofs*2);
-        for(unsigned c=0; c<numColEntities; ++c) {
-            GlobalOrdinal colGid0 = GID_(colEntityIds[c], numDof_ , 0);
-            int colOwner = colOwners[c];
-            for(unsigned cd=0; cd<numDof_; ++cd) {
-                sbuf.pack(colGid0++);
-                sbuf.pack(colOwner);
-            }
-        }
+    sbuf.pack(gid0);
+    sbuf.pack(numColEntities*2);
+    for(unsigned c=0; c<numColEntities; ++c) {
+        GlobalOrdinal colGid0 = GID_(colEntityIds[c], numDof , 0);
+        sbuf.pack(colGid0);
+        sbuf.pack(colOwners[c]);
     }
 }
 
 void communicate_remote_columns(const stk::mesh::BulkData& bulk,
                                 const std::vector<int>& neighborProcs,
                                 nalu_stk::CommNeighbors& commNeighbors,
+                                unsigned numDof,
                                 const Teuchos::RCP<LinSys::Map>& ownedRowsMap,
                                 Kokkos::View<size_t*,DeviceSpace>& deviceLocallyOwnedRowLengths,
                                 std::set<std::pair<int,GlobalOrdinal> >& communicatedColIndices)
@@ -810,13 +791,17 @@ void communicate_remote_columns(const stk::mesh::BulkData& bulk,
             if (lid < 0) {
                 std::cerr<<"P"<<bulk.parallel_rank()<<" lid="<<lid<<" for rowGid="<<rowGid<<" sent from proc "<<p<<std::endl;
             }
-            deviceLocallyOwnedRowLengths(lid) += numCols;
+            for(unsigned d=0; d<numDof; ++d) {
+                deviceLocallyOwnedRowLengths(lid++) += numCols*numDof;
+            }
             for(unsigned i=0; i<numCols; ++i) {
                 GlobalOrdinal colGid = 0;
                 rbuf.unpack(colGid);
                 int owner = 0;
                 rbuf.unpack(owner);
-                communicatedColIndices.insert(std::make_pair(owner,colGid));
+                for(unsigned dd=0; dd<numDof; ++dd) {
+                    communicatedColIndices.insert(std::make_pair(owner,colGid++));
+                }
             }
         }
         rbuf.resize(bufSize);
@@ -892,7 +877,7 @@ TpetraLinearSystem::compute_send_lengths(const ConnectionVec& connectionVec,
     if (entity_a_shared) {
         stk::mesh::Entity master = get_entity_master(bulk, entity_a, entityId_a);
         size_t idx = get_neighbor_index(neighborProcs, bulk.parallel_owner_rank(master));
-        sendLengths[idx] += numDof_*numColEntities*numDof_;
+        sendLengths[idx] += (1+numColEntities)*(sizeof(GlobalOrdinal)+sizeof(int));
     }
     
     for(size_t ii=i; ii<rowEnd; ++ii) {
@@ -900,13 +885,13 @@ TpetraLinearSystem::compute_send_lengths(const ConnectionVec& connectionVec,
         if (entity_b == entity_a) {
             continue;
         }
-        const stk::mesh::EntityId entityId_b = *stk::mesh::field_data(*realm_.naluGlobalId_, entity_b);
+        const stk::mesh::EntityId entityId_b = colEntityIds[ii-i];
         const int entity_b_status = (entityId_a != entityId_b) ? getDofStatus(entity_b) : entity_a_status;
         const bool entity_b_shared = entity_b_status & DS_GloballyOwnedDOF;
         if (entity_b_shared) {
             stk::mesh::Entity master = get_entity_master(bulk, entity_b, entityId_b);
             size_t idx = get_neighbor_index(neighborProcs, bulk.parallel_owner_rank(master));
-            sendLengths[idx] += numDof_*numColEntities*numDof_;
+            sendLengths[idx] += (1+numColEntities)*(sizeof(GlobalOrdinal)+sizeof(int));
         }
     } 
     i += numColEntities;
@@ -914,7 +899,7 @@ TpetraLinearSystem::compute_send_lengths(const ConnectionVec& connectionVec,
   
   for(size_t i=0; i<neighborProcs.size(); ++i) {
     nalu_stk::CommBufferV& sbuf = commNeighbors.send_buffer(neighborProcs[i]);
-    sbuf.reserve(sendLengths[i]*2);
+    sbuf.reserve(sendLengths[i]);
   }
 }
 
@@ -966,7 +951,7 @@ TpetraLinearSystem::compute_graph_row_lengths(const ConnectionVec& connectionVec
 
     const bool entity_a_shared = entity_a_status & DS_GloballyOwnedDOF;
     if (entity_a_shared) {
-        add_lengths_to_comm(bulk, commNeighbors, entity_a_master, entityId_a,
+        add_lengths_to_comm(bulk, commNeighbors, entity_a_owner, entityId_a,
                             numDof_, numColEntities, colEntityIds.data(), colOwners.data());
     }
 
@@ -975,7 +960,7 @@ TpetraLinearSystem::compute_graph_row_lengths(const ConnectionVec& connectionVec
         if (entity_b == entity_a) {
             continue;
         }
-        const stk::mesh::EntityId entityId_b = *stk::mesh::field_data(*realm_.naluGlobalId_, entity_b);
+        const stk::mesh::EntityId entityId_b = colEntityIds[ii-i];
         const int entity_b_status = (entityId_a != entityId_b) ? getDofStatus(entity_b) : entity_a_status;
         const bool entity_b_owned = entity_b_status & DS_OwnedDOF;
         LocalOrdinal lid_b = entityToLID_[entity_b.local_offset()];
@@ -983,8 +968,7 @@ TpetraLinearSystem::compute_graph_row_lengths(const ConnectionVec& connectionVec
 
         const bool entity_b_shared = entity_b_status & DS_GloballyOwnedDOF;
         if (entity_b_shared) {
-            stk::mesh::Entity entity_b_master = get_entity_master(bulk, entity_b, entityId_b);
-            add_lengths_to_comm(bulk, commNeighbors, entity_b_master, entityId_b, numDof_, 1, &entityId_a, &entity_a_owner);
+            add_lengths_to_comm(bulk, commNeighbors, colOwners[ii-i], entityId_b, numDof_, 1, &entityId_a, &entity_a_owner);
         }
     }
     i += numColEntities;
@@ -995,10 +979,12 @@ void
 insertIntoGraph(LinSys::Graph& crsGraph, LocalOrdinal rowLid, LocalOrdinal maxOwnedRowId,
                 unsigned numDof, unsigned numCols, const std::vector<LocalOrdinal>& colLids)
 {
-    LocalOrdinal lid = rowLid < maxOwnedRowId ? rowLid : rowLid - maxOwnedRowId;
+    if (rowLid >= maxOwnedRowId) {
+      rowLid -= maxOwnedRowId;
+    }
     //KOKKOS: small Loop noparallel insertLocalIndices
     for (unsigned d=0; d < numDof; ++d) {
-      crsGraph.insertLocalIndices(lid++, numCols, colLids.data());
+      crsGraph.insertLocalIndices(rowLid++, numCols, colLids.data());
     }
 }
 
@@ -1011,7 +997,6 @@ TpetraLinearSystem::insert_graph_connections(const ConnectionVec& connectionVec,
   unsigned max = 128;
   std::vector<stk::mesh::Entity> entities_b(max);
   std::vector<int> dofStatus(max);
-  std::vector<stk::mesh::EntityId> entityIds_b(max);
   std::vector<LocalOrdinal> localDofs_b(max*numDof_);
   const size_t numConnections = connectionVec.size();
 
@@ -1020,14 +1005,8 @@ TpetraLinearSystem::insert_graph_connections(const ConnectionVec& connectionVec,
   for(size_t i=0; i<numConnections; ) {
     const stk::mesh::Entity entity_a = connectionVec[i].first;
     int dofStatus_a = getDofStatus(entity_a);
-//    const stk::mesh::EntityId entityId_a = *stk::mesh::field_data(*realm_.naluGlobalId_, entity_a);
-//    GlobalOrdinal gid0a = GID_(entityId_a, numDof_, 0);
     {
-//      LinSys::Graph& crsGraph = (dofStatus_a & DS_OwnedDOF) ? locallyOwnedGraph : globallySharedGraph;
-//      const LinSys::Map& colMap = *crsGraph.getColMap();
-//      LocalOrdinal tlid = colMap.getLocalElement(gid0a);
       LocalOrdinal lid0 = entityToColLID_[entity_a.local_offset()];
-//      ThrowRequireMsg(tlid==lid0, "Expected lid0="<<lid0<<" to match tlid="<<tlid);
       for (size_t d=0; d < numDof_; ++d) {
         localDofs_a[d] = lid0++;
       }
@@ -1038,21 +1017,13 @@ TpetraLinearSystem::insert_graph_connections(const ConnectionVec& connectionVec,
             max *= 2;
             entities_b.resize(max);
             dofStatus.resize(max);
-            entityIds_b.resize(max);
             localDofs_b.resize(max*numDof_);
         }
         const stk::mesh::Entity entity_b = connectionVec[i+numColEntities].second;
         entities_b[numColEntities] = entity_b;
         dofStatus[numColEntities] = getDofStatus(entity_b);
-        stk::mesh::EntityId entityId_b = *stk::mesh::field_data(*realm_.naluGlobalId_, entity_b);
-        entityIds_b[numColEntities] = entityId_b;
 
-//        GlobalOrdinal gid0b = GID_(entityId_b, numDof_, 0);
-//        LinSys::Graph& crsGraph = (dofStatus[numColEntities] & DS_OwnedDOF) ? locallyOwnedGraph : globallySharedGraph;
-//        const LinSys::Map& colMap = *crsGraph.getColMap();
-//        LocalOrdinal tlid = colMap.getLocalElement(gid0b);
         LocalOrdinal lid0 = entityToColLID_[entity_b.local_offset()]; 
-//        ThrowRequireMsg(tlid==lid0, "Expected lid0="<<lid0<<" to match tlid="<<tlid);
         unsigned idx = numColEntities*numDof_;
         for (unsigned d=0; d < numDof_; ++d) {
           localDofs_b[idx++] = lid0++;
@@ -1079,26 +1050,35 @@ TpetraLinearSystem::insert_graph_connections(const ConnectionVec& connectionVec,
 
 void insert_communicated_col_indices(const std::vector<int>& neighborProcs,
                                      nalu_stk::CommNeighbors& commNeighbors,
+                                     unsigned numDof,
                                      LinSys::Graph& ownedGraph)
 {
     const LinSys::Map& rowMap = *ownedGraph.getRowMap();
     const LinSys::Map& colMap = *ownedGraph.getColMap();
-    LocalOrdinal lid;
     for(int p : neighborProcs) {
         nalu_stk::CommBufferV& rbuf = commNeighbors.recv_buffer(p);
         while(rbuf.size_in_bytes() > 0) {
-            stk::mesh::EntityId gid = 0;
-            rbuf.unpack(gid);
+            stk::mesh::EntityId rowGid = 0;
+            rbuf.unpack(rowGid);
             unsigned len = 0;
             rbuf.unpack(len);
             unsigned numCols = len/2;
+            LocalOrdinal rowLid = rowMap.getLocalElement(rowGid);
             for(unsigned i=0; i<numCols; ++i) {
                 GlobalOrdinal colGid = 0;
                 rbuf.unpack(colGid);
                 int owner = 0;
                 rbuf.unpack(owner);
-                lid = colMap.getLocalElement(colGid);
-                ownedGraph.insertLocalIndices(rowMap.getLocalElement(gid),1,&lid);
+                LocalOrdinal colLid = colMap.getLocalElement(colGid);
+                LocalOrdinal rLid = rowLid;
+                for(unsigned d=0; d<numDof; ++d) {
+                    LocalOrdinal cLid = colLid;
+                    for(unsigned dd=0; dd<numDof; ++dd) {
+                        ownedGraph.insertLocalIndices(rLid,1,&cLid);
+                        ++cLid;
+                    }
+                    ++rLid;
+                }
             }
         }
     }
@@ -1115,11 +1095,6 @@ TpetraLinearSystem::fill_entity_to_row_LID_mapping()
         const stk::mesh::EntityId* nodeIds = stk::mesh::field_data(*realm_.naluGlobalId_, b);
         for(size_t i=0; i<b.size(); ++i) {
             stk::mesh::Entity node = b[i];
-//if (node.local_offset()==235606){
-//std::cerr<<"offset 235606, nalu-id="<<nodeIds[i]<<", stk-id="<<bulk.identifier(node)
-//  <<", numElems: "<<bulk.num_elements(node)<<", owned="<<b.owned()<<", shared="<<b.shared()
-//   <<std::endl;
-//}
             entityToLID_[node.local_offset()] = myLIDs_[nodeIds[i]];
         }
     }
@@ -1183,61 +1158,6 @@ void fill_neighbor_procs(std::vector<int>& neighborProcs,
         neighborProcs.insert(neighborProcs.end(), ghostCommProcs.begin(), ghostCommProcs.end());
         stk::util::sort_and_unique(neighborProcs);
     }
-}
-
-bool is_owned_or_shared(GlobalOrdinal idx, const Teuchos::RCP<LinSys::Map>& linsysMap)
-{ 
-  return linsysMap->isNodeGlobalElement(idx);
-}
-
-void add_owned(std::vector<GlobalOrdinal>& totalGids,
-               int localProc,
-               const std::set<std::pair<int,GlobalOrdinal> >& ownersAndGids,
-               const Teuchos::RCP<LinSys::Map>& ownedPlusGloballyOwnedRowsMap)
-{ 
-  for(auto procAndGid : ownersAndGids) {
-      if (procAndGid.first == localProc && !is_owned_or_shared(procAndGid.second, ownedPlusGloballyOwnedRowsMap)) {
-          totalGids.push_back(procAndGid.second);
-      }
-      if (procAndGid.first > localProc) break;
-  }
-}
-
-void add_non_owned_ordered_by_proc(std::vector<GlobalOrdinal>& totalGids,
-               int localProc,
-               const std::set<std::pair<int,GlobalOrdinal> >& ownersAndGids,
-               const Teuchos::RCP<LinSys::Map>& ownedPlusGloballyOwnedRowsMap)
-{ 
-  for(auto procAndGid : ownersAndGids) {
-    if (procAndGid.first != localProc &&
-        !is_owned_or_shared(procAndGid.second, ownedPlusGloballyOwnedRowsMap))
-    { 
-      totalGids.push_back(procAndGid.second);
-    }
-  }
-}
-
-void fill_owned_then_nonowned_ordered_by_proc(std::vector<GlobalOrdinal>& totalGids,
-                                    int localProc,
-                                    const Teuchos::RCP<LinSys::Map>& ownedRowsMap,
-                                    const Teuchos::RCP<LinSys::Map>& globallyOwnedRowsMap,
-                                    const std::set<std::pair<int,GlobalOrdinal> >& ownersAndGids)
-{ 
-  auto ownedIndices = ownedRowsMap->getMyGlobalIndices();
-  totalGids.clear();
-  totalGids.reserve(ownedIndices.size() + ownersAndGids.size());
-  
-  for(unsigned i=0; i<ownedIndices.size(); ++i) {
-    totalGids.push_back(ownedIndices[i]);
-  }
-  
-  for(const std::pair<int,GlobalOrdinal>& procAndGid : ownersAndGids) {
-    int proc = procAndGid.first;
-    GlobalOrdinal gid = procAndGid.second;
-    if (proc != localProc && !ownedRowsMap->isNodeGlobalElement(gid)) {
-      totalGids.push_back(gid);
-    }
-  }
 }
 
 void fill_owned_and_shared_then_nonowned_ordered_by_proc(std::vector<GlobalOrdinal>& totalGids,
@@ -1402,7 +1322,7 @@ TpetraLinearSystem::finalizeLinearSystem()
   ownersAndGids_.clear();
   storeOwnersForShared();
 
-  communicate_remote_columns(bulkData, neighborProcs, commNeighbors, ownedRowsMap_, ownedRowLengths, ownersAndGids_);
+  communicate_remote_columns(bulkData, neighborProcs, commNeighbors, numDof_, ownedRowsMap_, ownedRowLengths, ownersAndGids_);
 
   int localProc = bulkData.parallel_rank();
 
@@ -1418,21 +1338,29 @@ TpetraLinearSystem::finalizeLinearSystem()
   const Teuchos::RCP<LinSys::Comm> tpetraComm = Teuchos::rcp(new LinSys::Comm(bulkData.parallel()));
   totalColsMap_ = Teuchos::rcp(new LinSys::Map(Teuchos::OrdinalTraits<Tpetra::global_size_t>::invalid(), optColGids, 1, tpetraComm, node_));
 
-  globallyOwnedGraph_ = Teuchos::rcp(new LinSys::Graph(globallyOwnedRowsMap_, ownedPlusGloballyOwnedRowsMap_, globallyOwnedRowLengths, Tpetra::StaticProfile));
+  globallyOwnedGraph_ = Teuchos::rcp(new LinSys::Graph(globallyOwnedRowsMap_, totalColsMap_, globallyOwnedRowLengths, Tpetra::StaticProfile));
  
   ownedGraph_ = Teuchos::rcp(new LinSys::Graph(ownedRowsMap_, totalColsMap_, locallyOwnedRowLengths, Tpetra::StaticProfile));
+//static int counter = 0;
+//  std::ostringstream os;
+//  os<<"ownedLen."<<counter<<"."<<bulkData.parallel_rank();
+//  std::ofstream ofs(os.str());
+//  for(size_t ii=0; ii<ownedRowLengths.size(); ++ii) {
+//    ofs<<ownedRowLengths[ii]<<std::endl;
+//  }
+//++counter;
 
   fill_entity_to_col_LID_mapping();
 
   insert_graph_connections(connectionVec, *ownedGraph_, *globallyOwnedGraph_);
 
-  insert_communicated_col_indices(neighborProcs, commNeighbors, *ownedGraph_);
+  insert_communicated_col_indices(neighborProcs, commNeighbors, numDof_, *ownedGraph_);
 
   ownedGraph_->fillComplete(ownedRowsMap_, ownedRowsMap_);
+  globallyOwnedGraph_->fillComplete();
+
 //  static int counter = 0;
   //dump_graph("ownedGraph", counter, bulkData.parallel_rank(), *ownedGraph_);
-
-  globallyOwnedGraph_->fillComplete();
   //dump_graph("globallyOwnedGraph", counter, bulkData.parallel_rank(), *globallyOwnedGraph_);
 //++counter;
 //  verify_row_lengths(*ownedGraph_, ownedRowLengths, localProc);
@@ -1464,7 +1392,6 @@ TpetraLinearSystem::finalizeLinearSystem()
 
   linearSolver->setupLinearSolver(sln_, ownedMatrix_, ownedRhs_, coords);
 //NaluEnv::self().naluOutputP0() << "leaving TpetraLinearSystem::finalizeLinearSystem"<<std::endl;
-++counter_;
 }
 
 void
