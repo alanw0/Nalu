@@ -757,9 +757,9 @@ void add_lengths_to_comm(const stk::mesh::BulkData& bulk,
 {   
     int owner = entity_a_owner;
     nalu_stk::CommBufferV& sbuf = commNeighbors.send_buffer(owner);
-    GlobalOrdinal gid0 = GID_(entityId_a, numDof , 0);
+    GlobalOrdinal rowGid = GID_(entityId_a, numDof , 0);
     
-    sbuf.pack(gid0);
+    sbuf.pack(rowGid);
     sbuf.pack(numColEntities*2);
     for(unsigned c=0; c<numColEntities; ++c) {
         GlobalOrdinal colGid0 = GID_(colEntityIds[c], numDof , 0);
@@ -976,7 +976,7 @@ TpetraLinearSystem::compute_graph_row_lengths(const ConnectionVec& connectionVec
 }
 
 void
-insertIntoGraph(LinSys::Graph& crsGraph, LocalOrdinal rowLid, LocalOrdinal maxOwnedRowId,
+insertIntoGraph(CSGraph& crsGraph, LocalOrdinal rowLid, LocalOrdinal maxOwnedRowId,
                 unsigned numDof, unsigned numCols, const std::vector<LocalOrdinal>& colLids)
 {
     if (rowLid >= maxOwnedRowId) {
@@ -984,20 +984,20 @@ insertIntoGraph(LinSys::Graph& crsGraph, LocalOrdinal rowLid, LocalOrdinal maxOw
     }
     //KOKKOS: small Loop noparallel insertLocalIndices
     for (unsigned d=0; d < numDof; ++d) {
-      crsGraph.insertLocalIndices(rowLid++, numCols, colLids.data());
+      crsGraph.insertIndices(rowLid++, numCols, colLids.data(), numDof);
     }
 }
 
 void
 TpetraLinearSystem::insert_graph_connections(const ConnectionVec& connectionVec,
-                                             LinSys::Graph& locallyOwnedGraph,
-                                             LinSys::Graph& globallySharedGraph)
+                                             CSGraph& locallyOwnedGraph,
+                                             CSGraph& globallySharedGraph)
 {
-  std::vector<LocalOrdinal> localDofs_a(numDof_);
+  std::vector<LocalOrdinal> localDofs_a(1);
   unsigned max = 128;
   std::vector<stk::mesh::Entity> entities_b(max);
   std::vector<int> dofStatus(max);
-  std::vector<LocalOrdinal> localDofs_b(max*numDof_);
+  std::vector<LocalOrdinal> localDofs_b(max);
   const size_t numConnections = connectionVec.size();
 
   unsigned numColEntities = 0;
@@ -1006,10 +1006,7 @@ TpetraLinearSystem::insert_graph_connections(const ConnectionVec& connectionVec,
     const stk::mesh::Entity entity_a = connectionVec[i].first;
     int dofStatus_a = getDofStatus(entity_a);
     {
-      LocalOrdinal lid0 = entityToColLID_[entity_a.local_offset()];
-      for (size_t d=0; d < numDof_; ++d) {
-        localDofs_a[d] = lid0++;
-      }
+      localDofs_a[0] = entityToColLID_[entity_a.local_offset()];
     }
 
     while(i+numColEntities<numConnections && connectionVec[i+numColEntities].first == entity_a) {
@@ -1017,29 +1014,24 @@ TpetraLinearSystem::insert_graph_connections(const ConnectionVec& connectionVec,
             max *= 2;
             entities_b.resize(max);
             dofStatus.resize(max);
-            localDofs_b.resize(max*numDof_);
+            localDofs_b.resize(max);
         }
         const stk::mesh::Entity entity_b = connectionVec[i+numColEntities].second;
         entities_b[numColEntities] = entity_b;
         dofStatus[numColEntities] = getDofStatus(entity_b);
-
-        LocalOrdinal lid0 = entityToColLID_[entity_b.local_offset()]; 
-        unsigned idx = numColEntities*numDof_;
-        for (unsigned d=0; d < numDof_; ++d) {
-          localDofs_b[idx++] = lid0++;
-        }
+        localDofs_b[numColEntities] = entityToColLID_[entity_b.local_offset()];
         ++numColEntities;
     }
 
     {
-      LinSys::Graph& crsGraph = (dofStatus_a & DS_OwnedDOF) ? locallyOwnedGraph : globallySharedGraph;
-      insertIntoGraph(crsGraph, entityToLID_[entity_a.local_offset()], maxOwnedRowId_, numDof_, numColEntities*numDof_, localDofs_b);
+      CSGraph& crsGraph = (dofStatus_a & DS_OwnedDOF) ? locallyOwnedGraph : globallySharedGraph;
+      insertIntoGraph(crsGraph, entityToLID_[entity_a.local_offset()], maxOwnedRowId_, numDof_, numColEntities, localDofs_b);
     }
 
     for(unsigned j=0; j<numColEntities; ++j) {
       if (entities_b[j] != entity_a) {
-        LinSys::Graph& crsGraph = (dofStatus[j] & DS_OwnedDOF) ? locallyOwnedGraph : globallySharedGraph;
-        insertIntoGraph(crsGraph, entityToLID_[entities_b[j].local_offset()], maxOwnedRowId_, numDof_, numDof_, localDofs_a);
+        CSGraph& crsGraph = (dofStatus[j] & DS_OwnedDOF) ? locallyOwnedGraph : globallySharedGraph;
+        insertIntoGraph(crsGraph, entityToLID_[entities_b[j].local_offset()], maxOwnedRowId_, numDof_, 1, localDofs_a);
       }
     }
 
@@ -1051,10 +1043,11 @@ TpetraLinearSystem::insert_graph_connections(const ConnectionVec& connectionVec,
 void insert_communicated_col_indices(const std::vector<int>& neighborProcs,
                                      nalu_stk::CommNeighbors& commNeighbors,
                                      unsigned numDof,
-                                     LinSys::Graph& ownedGraph)
+                                     CSGraph& ownedGraph,
+                                     const LinSys::Map& rowMap,
+                                     const LinSys::Map& colMap)
 {
-    const LinSys::Map& rowMap = *ownedGraph.getRowMap();
-    const LinSys::Map& colMap = *ownedGraph.getColMap();
+    std::vector<LocalOrdinal> colLids;
     for(int p : neighborProcs) {
         nalu_stk::CommBufferV& rbuf = commNeighbors.recv_buffer(p);
         while(rbuf.size_in_bytes() > 0) {
@@ -1063,22 +1056,17 @@ void insert_communicated_col_indices(const std::vector<int>& neighborProcs,
             unsigned len = 0;
             rbuf.unpack(len);
             unsigned numCols = len/2;
+            colLids.resize(numCols);
             LocalOrdinal rowLid = rowMap.getLocalElement(rowGid);
             for(unsigned i=0; i<numCols; ++i) {
                 GlobalOrdinal colGid = 0;
                 rbuf.unpack(colGid);
                 int owner = 0;
                 rbuf.unpack(owner);
-                LocalOrdinal colLid = colMap.getLocalElement(colGid);
-                LocalOrdinal rLid = rowLid;
-                for(unsigned d=0; d<numDof; ++d) {
-                    LocalOrdinal cLid = colLid;
-                    for(unsigned dd=0; dd<numDof; ++dd) {
-                        ownedGraph.insertLocalIndices(rLid,1,&cLid);
-                        ++cLid;
-                    }
-                    ++rLid;
-                }
+                colLids[i] = colMap.getLocalElement(colGid);
+            }
+            for(unsigned d=0; d<numDof; ++d) {
+                ownedGraph.insertIndices(rowLid++,numCols,colLids.data(), numDof);
             }
         }
     }
@@ -1283,6 +1271,35 @@ void dump_graph(const std::string& name, int counter, int proc, LinSys::Graph& g
     }
 }
 
+void remove_invalid_indices(CSGraph& csg, Kokkos::View<size_t*,DeviceSpace>& rowLengths)
+{
+  size_t nnz = csg.rowPointers[rowLengths.size()];
+  for(int i=0, ie=csg.rowPointers.size()-1; i<ie; ++i) {
+    LocalOrdinal* row = &csg.colIndices[csg.rowPointers[i]];
+    size_t rowLen = csg.rowPointers[i+1]-csg.rowPointers[i];
+    for(size_t j=0; j<rowLen; ++j) {
+      if (row[j] == CSGraph::INVALID) {
+        rowLengths(i) = j;
+        break;
+      }
+    }
+  }
+
+  CSGraph::compute_row_pointers(csg.rowPointers, rowLengths);
+  size_t newNnz = csg.rowPointers[rowLengths.size()];
+
+  if (newNnz < nnz) {
+    Teuchos::ArrayRCP<LocalOrdinal> newColIndices = Teuchos::arcp<LocalOrdinal>(newNnz);
+    int index = 0;
+    for(int i=0, ie = csg.colIndices.size(); i<ie; ++i) {
+      if (csg.colIndices[i] != CSGraph::INVALID) {
+        newColIndices[index++] = csg.colIndices[i];
+      }
+    }
+    csg.colIndices = newColIndices;
+  }
+}
+
 void
 TpetraLinearSystem::finalizeLinearSystem()
 {
@@ -1324,6 +1341,9 @@ TpetraLinearSystem::finalizeLinearSystem()
 
   communicate_remote_columns(bulkData, neighborProcs, commNeighbors, numDof_, ownedRowsMap_, ownedRowLengths, ownersAndGids_);
 
+  CSGraph ownedGraph(ownedRowLengths);
+  CSGraph globallyOwnedGraph(globalRowLengths);
+
   int localProc = bulkData.parallel_rank();
 
   std::vector<GlobalOrdinal> optColGids;
@@ -1338,6 +1358,15 @@ TpetraLinearSystem::finalizeLinearSystem()
   const Teuchos::RCP<LinSys::Comm> tpetraComm = Teuchos::rcp(new LinSys::Comm(bulkData.parallel()));
   totalColsMap_ = Teuchos::rcp(new LinSys::Map(Teuchos::OrdinalTraits<Tpetra::global_size_t>::invalid(), optColGids, 1, tpetraComm, node_));
 
+  fill_entity_to_col_LID_mapping();
+
+  insert_graph_connections(connectionVec, ownedGraph, globallyOwnedGraph);
+
+  insert_communicated_col_indices(neighborProcs, commNeighbors, numDof_, ownedGraph, *ownedRowsMap_, *totalColsMap_);
+
+  remove_invalid_indices(ownedGraph, ownedRowLengths);
+  remove_invalid_indices(globallyOwnedGraph, globalRowLengths);
+
   globallyOwnedGraph_ = Teuchos::rcp(new LinSys::Graph(globallyOwnedRowsMap_, totalColsMap_, globallyOwnedRowLengths, Tpetra::StaticProfile));
  
   ownedGraph_ = Teuchos::rcp(new LinSys::Graph(ownedRowsMap_, totalColsMap_, locallyOwnedRowLengths, Tpetra::StaticProfile));
@@ -1350,14 +1379,15 @@ TpetraLinearSystem::finalizeLinearSystem()
 //  }
 //++counter;
 
-  fill_entity_to_col_LID_mapping();
-
-  insert_graph_connections(connectionVec, *ownedGraph_, *globallyOwnedGraph_);
-
-  insert_communicated_col_indices(neighborProcs, commNeighbors, numDof_, *ownedGraph_);
-
-  ownedGraph_->fillComplete(ownedRowsMap_, ownedRowsMap_);
-  globallyOwnedGraph_->fillComplete();
+  ownedGraph_->setAllIndices(ownedGraph.rowPointers, ownedGraph.colIndices);
+  globallyOwnedGraph_->setAllIndices(globallyOwnedGraph.rowPointers, globallyOwnedGraph.colIndices);
+//  Teuchos::RCP<LinSys::Import> importer = Teuchos::rcp(new LinSys::Import(ownedRowsMap_, totalColsMap_));
+//  ownedGraph_->expertStaticFillComplete(ownedRowsMap_, ownedRowsMap_, importer);
+//  globallyOwnedGraph_->expertStaticFillComplete(ownedRowsMap_, ownedRowsMap_);
+  Teuchos::RCP<Teuchos::ParameterList> params = Teuchos::rcp(new Teuchos::ParameterList);
+  params->set<bool>("No Nonlocal Changes", true);
+  ownedGraph_->fillComplete(ownedRowsMap_, ownedRowsMap_, params);
+  globallyOwnedGraph_->fillComplete(ownedRowsMap_, ownedRowsMap_, params);
 
 //  static int counter = 0;
   //dump_graph("ownedGraph", counter, bulkData.parallel_rank(), *ownedGraph_);

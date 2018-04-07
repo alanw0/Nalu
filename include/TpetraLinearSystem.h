@@ -39,6 +39,7 @@ namespace nalu {
 class Realm;
 class EquationSystem;
 class LinearSolver;
+class CSGraph;
 
 typedef boost::unordered_map<stk::mesh::EntityId, size_t>  MyLIDMapType;
 
@@ -162,8 +163,8 @@ private:
                                  nalu_stk::CommNeighbors& commNeighbors);
 
   void insert_graph_connections(const ConnectionVec& connectionVec,
-                                LinSys::Graph& locallyOwnedGraph,
-                                LinSys::Graph& globallySharedGraph);
+                                CSGraph& locallyOwnedGraph,
+                                CSGraph& globallySharedGraph);
 
   void fill_entity_to_row_LID_mapping();
   void fill_entity_to_col_LID_mapping();
