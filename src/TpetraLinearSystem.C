@@ -1274,36 +1274,36 @@ void dump_graph(const std::string& name, int counter, int proc, LinSys::Graph& g
 void remove_invalid_indices(CSGraph& csg, Kokkos::View<size_t*,DeviceSpace>& rowLengths)
 {
   size_t nnz = csg.rowPointers[rowLengths.size()];
+  size_t newNnz = 0;
   for(int i=0, ie=csg.rowPointers.size()-1; i<ie; ++i) {
     LocalOrdinal* row = &csg.colIndices[csg.rowPointers[i]];
-    size_t rowLen = csg.rowPointers[i+1]-csg.rowPointers[i];
-    for(size_t j=0; j<rowLen; ++j) {
-      if (row[j] == CSGraph::INVALID) {
-        rowLengths(i) = j;
+    int rowLen = csg.rowPointers[i+1]-csg.rowPointers[i];
+    for(int j=rowLen-1; j>=0; --j) {
+      if (row[j] != CSGraph::INVALID) {
+        rowLengths(i) = j+1;
         break;
       }
     }
+    newNnz += rowLengths(i);
   }
-
-  CSGraph::compute_row_pointers(csg.rowPointers, rowLengths);
-  size_t newNnz = csg.rowPointers[rowLengths.size()];
 
   if (newNnz < nnz) {
     Teuchos::ArrayRCP<LocalOrdinal> newColIndices = Teuchos::arcp<LocalOrdinal>(newNnz);
     int index = 0;
-    for(int i=0, ie = csg.colIndices.size(); i<ie; ++i) {
-      if (csg.colIndices[i] != CSGraph::INVALID) {
-        newColIndices[index++] = csg.colIndices[i];
+    for(int i=0, ie=csg.rowPointers.size()-1; i<ie; ++i) {
+      int rowBeg = csg.rowPointers[i];
+      for(int j=rowBeg, jend=rowBeg+rowLengths(i); j<jend; ++j) {
+        newColIndices[index++] = csg.colIndices[j];
       }
     }
     csg.colIndices = newColIndices;
+    CSGraph::compute_row_pointers(csg.rowPointers, rowLengths);
   }
 }
 
 void
 TpetraLinearSystem::finalizeLinearSystem()
 {
-//NaluEnv::self().naluOutputP0() << "TpetraLinearSystem::finalizeLinearSystem"<<std::endl;
   ThrowRequire(inConstruction_);
   inConstruction_ = false;
 
@@ -1325,11 +1325,6 @@ TpetraLinearSystem::finalizeLinearSystem()
 
   std::vector<int> neighborProcs;
   fill_neighbor_procs(neighborProcs, bulkData, realm_);
-//std::ostringstream os;
-//os<<"P"<<bulkData.parallel_rank()<<" neighbors: ";
-//for(int p : neighborProcs) os<<p<<",";
-//os<<std::endl;
-//std::cerr<<os.str();
 
   nalu_stk::CommNeighbors commNeighbors(bulkData.parallel(), neighborProcs);
 
@@ -1349,12 +1344,6 @@ TpetraLinearSystem::finalizeLinearSystem()
   std::vector<GlobalOrdinal> optColGids;
   fill_owned_and_shared_then_nonowned_ordered_by_proc(optColGids, localProc, ownedRowsMap_, globallyOwnedRowsMap_, ownersAndGids_);
 
-  //dump_vec("totalGids", bulkData.parallel_rank(), counter, totalGids_);
-  //dump_vec("optColGids", bulkData.parallel_rank(), counter, optColGids);
-
-//  verify_same_except_sort_order(totalGids_, "totalGids", optColGids, "optColGids", localProc);
-
-  // This is the column map for the owned graph now
   const Teuchos::RCP<LinSys::Comm> tpetraComm = Teuchos::rcp(new LinSys::Comm(bulkData.parallel()));
   totalColsMap_ = Teuchos::rcp(new LinSys::Map(Teuchos::OrdinalTraits<Tpetra::global_size_t>::invalid(), optColGids, 1, tpetraComm, node_));
 
@@ -1365,19 +1354,10 @@ TpetraLinearSystem::finalizeLinearSystem()
   insert_communicated_col_indices(neighborProcs, commNeighbors, numDof_, ownedGraph, *ownedRowsMap_, *totalColsMap_);
 
   remove_invalid_indices(ownedGraph, ownedRowLengths);
-  remove_invalid_indices(globallyOwnedGraph, globalRowLengths);
 
   globallyOwnedGraph_ = Teuchos::rcp(new LinSys::Graph(globallyOwnedRowsMap_, totalColsMap_, globallyOwnedRowLengths, Tpetra::StaticProfile));
  
   ownedGraph_ = Teuchos::rcp(new LinSys::Graph(ownedRowsMap_, totalColsMap_, locallyOwnedRowLengths, Tpetra::StaticProfile));
-//static int counter = 0;
-//  std::ostringstream os;
-//  os<<"ownedLen."<<counter<<"."<<bulkData.parallel_rank();
-//  std::ofstream ofs(os.str());
-//  for(size_t ii=0; ii<ownedRowLengths.size(); ++ii) {
-//    ofs<<ownedRowLengths[ii]<<std::endl;
-//  }
-//++counter;
 
   ownedGraph_->setAllIndices(ownedGraph.rowPointers, ownedGraph.colIndices);
   globallyOwnedGraph_->setAllIndices(globallyOwnedGraph.rowPointers, globallyOwnedGraph.colIndices);
@@ -1388,12 +1368,6 @@ TpetraLinearSystem::finalizeLinearSystem()
   params->set<bool>("No Nonlocal Changes", true);
   ownedGraph_->fillComplete(ownedRowsMap_, ownedRowsMap_, params);
   globallyOwnedGraph_->fillComplete(ownedRowsMap_, ownedRowsMap_, params);
-
-//  static int counter = 0;
-  //dump_graph("ownedGraph", counter, bulkData.parallel_rank(), *ownedGraph_);
-  //dump_graph("globallyOwnedGraph", counter, bulkData.parallel_rank(), *globallyOwnedGraph_);
-//++counter;
-//  verify_row_lengths(*ownedGraph_, ownedRowLengths, localProc);
 
   ownedMatrix_ = Teuchos::rcp(new LinSys::Matrix(ownedGraph_));
   globallyOwnedMatrix_ = Teuchos::rcp(new LinSys::Matrix(globallyOwnedGraph_));
@@ -1421,7 +1395,6 @@ TpetraLinearSystem::finalizeLinearSystem()
     copy_stk_to_tpetra(coordinates, coords);
 
   linearSolver->setupLinearSolver(sln_, ownedMatrix_, ownedRhs_, coords);
-//NaluEnv::self().naluOutputP0() << "leaving TpetraLinearSystem::finalizeLinearSystem"<<std::endl;
 }
 
 void
