@@ -233,6 +233,7 @@ TpetraLinearSystem::beginLinearSystemConstruction()
   std::vector<GlobalOrdinal> ownedGids, sharedNotOwnedGids;
   ownedGids.reserve(maxOwnedRowId_);
   sharedNotOwnedGids.reserve(numSharedNotOwnedNotLocallyOwned*numDof_);
+  sharedPids_.reserve(sharedNotOwnedGids.capacity());
 
   // owned first:
   for(const stk::mesh::Bucket* bptr : buckets) {
@@ -278,9 +279,11 @@ TpetraLinearSystem::beginLinearSystemConstruction()
     const stk::mesh::Entity entity = shared_not_owned_nodes[inode];
     const stk::mesh::EntityId naluId = *stk::mesh::field_data(*realm_.naluGlobalId_, entity);
     myLIDs_[naluId] = numDof_*localId++;
+    int owner = bulkData.parallel_owner_rank(entity);
     for(unsigned idof=0; idof < numDof_; ++ idof) {
       const GlobalOrdinal gid = GID_(naluId, numDof_, idof);
       sharedNotOwnedGids.push_back(gid);
+      sharedPids_.push_back(owner);
     }
   }
   
@@ -1044,15 +1047,19 @@ void fill_neighbor_procs(std::vector<int>& neighborProcs,
 }
 
 void fill_owned_and_shared_then_nonowned_ordered_by_proc(std::vector<GlobalOrdinal>& totalGids,
+                                    std::vector<int>& srcPids,
                                     int localProc,
                                     const Teuchos::RCP<LinSys::Map>& ownedRowsMap,
                                     const Teuchos::RCP<LinSys::Map>& sharedNotOwnedRowsMap,
-                                    const std::set<std::pair<int,GlobalOrdinal> >& ownersAndGids)
+                                    const std::set<std::pair<int,GlobalOrdinal> >& ownersAndGids,
+                                    const std::vector<int>& sharedPids)
 { 
   auto ownedIndices = ownedRowsMap->getMyGlobalIndices();
   totalGids.clear();
   totalGids.reserve(ownedIndices.size() + ownersAndGids.size());
-  
+  srcPids.clear();
+  srcPids.reserve(ownersAndGids.size());
+ 
   for(unsigned i=0; i<ownedIndices.size(); ++i) {
     totalGids.push_back(ownedIndices[i]);
   }
@@ -1060,6 +1067,7 @@ void fill_owned_and_shared_then_nonowned_ordered_by_proc(std::vector<GlobalOrdin
   auto sharedIndices = sharedNotOwnedRowsMap->getMyGlobalIndices();
   for(unsigned i=0; i<sharedIndices.size(); ++i) {
     totalGids.push_back(sharedIndices[i]);
+    srcPids.push_back(sharedPids[i]);
   }
 
   for(const std::pair<int,GlobalOrdinal>& procAndGid : ownersAndGids) {
@@ -1069,6 +1077,7 @@ void fill_owned_and_shared_then_nonowned_ordered_by_proc(std::vector<GlobalOrdin
         !ownedRowsMap->isNodeGlobalElement(gid) &&
         !sharedNotOwnedRowsMap->isNodeGlobalElement(gid)) {
       totalGids.push_back(gid);
+      srcPids.push_back(procAndGid.first);
     }
   }
 }
@@ -1266,14 +1275,11 @@ TpetraLinearSystem::finalizeLinearSystem()
   int localProc = bulkData.parallel_rank();
 
   std::vector<GlobalOrdinal> optColGids;
-  fill_owned_and_shared_then_nonowned_ordered_by_proc(optColGids, localProc, ownedRowsMap_, sharedNotOwnedRowsMap_, ownersAndGids_);
+  std::vector<int> sourcePIDs;
+  fill_owned_and_shared_then_nonowned_ordered_by_proc(optColGids, sourcePIDs, localProc, ownedRowsMap_, sharedNotOwnedRowsMap_, ownersAndGids_,  sharedPids_);
 
   const Teuchos::RCP<LinSys::Comm> tpetraComm = Teuchos::rcp(new LinSys::Comm(bulkData.parallel()));
   totalColsMap_ = Teuchos::rcp(new LinSys::Map(Teuchos::OrdinalTraits<Tpetra::global_size_t>::invalid(), optColGids, 1, tpetraComm, node_));
-  //Teuchos::RCP<LinSys::Map> tmpColMap = Teuchos::rcp(new LinSys::Map(Teuchos::OrdinalTraits<Tpetra::global_size_t>::invalid(), optColGids, 1, tpetraComm, node_));
-  //std::ostringstream os;
-  //bool lclErr = false;
-  //totalColsMap_ = Teuchos::rcp(new LinSys::Map(Tpetra::Details::makeOptimizedColMap(os, lclErr, *ownedRowsMap_, *tmpColMap)));
 
   fill_entity_to_col_LID_mapping();
 
@@ -1292,13 +1298,16 @@ TpetraLinearSystem::finalizeLinearSystem()
 
   ownedGraph_->setAllIndices(ownedGraph.rowPointers, ownedGraph.colIndices);
   sharedNotOwnedGraph_->setAllIndices(sharedNotOwnedGraph.rowPointers, sharedNotOwnedGraph.colIndices);
-//  Teuchos::RCP<LinSys::Import> importer = Teuchos::rcp(new LinSys::Import(ownedRowsMap_, totalColsMap_));
-//  ownedGraph_->expertStaticFillComplete(ownedRowsMap_, ownedRowsMap_, importer);
-//  sharedNotOwnedGraph_->expertStaticFillComplete(ownedRowsMap_, ownedRowsMap_);
   Teuchos::RCP<Teuchos::ParameterList> params = Teuchos::rcp(new Teuchos::ParameterList);
   params->set<bool>("No Nonlocal Changes", true);
-  ownedGraph_->fillComplete(ownedRowsMap_, ownedRowsMap_, params);
-  sharedNotOwnedGraph_->fillComplete(ownedRowsMap_, ownedRowsMap_, params);
+//  params->set<bool>("compute global constants", false);
+  params->set<bool>("compute local triangular constants", false);
+  bool allowedToReorderLocally = false;
+  Teuchos::RCP<LinSys::Import> importer = Teuchos::rcp(new LinSys::Import(ownedRowsMap_, optColGids.data()+ownedRowLengths.size(), sourcePIDs.data(), sourcePIDs.size(), allowedToReorderLocally));
+  ownedGraph_->expertStaticFillComplete(ownedRowsMap_, ownedRowsMap_, importer, Teuchos::null, params);
+  sharedNotOwnedGraph_->expertStaticFillComplete(ownedRowsMap_, ownedRowsMap_, Teuchos::null, Teuchos::null, params);
+//  ownedGraph_->fillComplete(ownedRowsMap_, ownedRowsMap_, params);
+//  sharedNotOwnedGraph_->fillComplete(ownedRowsMap_, ownedRowsMap_, params);
 
   ownedMatrix_ = Teuchos::rcp(new LinSys::Matrix(ownedGraph_));
   sharedNotOwnedMatrix_ = Teuchos::rcp(new LinSys::Matrix(sharedNotOwnedGraph_));
